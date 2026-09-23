@@ -150,8 +150,8 @@ with `std.log` unless you give it something else.
 
 ## Connections
 
-`run` accepts connections until the listener is shut down, and serves
-each one on its own task. The `gpa` you give it is used from all of them
+`run` accepts connections until it is stopped, and serves each one on
+its own task. The `gpa` you give it is used from all of them
 at once, so it has to be thread-safe. Each connection allocates three
 buffers of `buffer` bytes and an arena. A request head has to fit in one
 buffer.
@@ -164,6 +164,21 @@ is too slow gets a 408.
 If you want your own accept loop, call `App.serveStream` for each
 connection. If you want your own connection loop too, `App.Dispatch` is
 the handler to give martensite's `serve`.
+
+## Stopping
+
+`zither.stopOnSignals(&listener)` stops `run` on SIGINT or SIGTERM,
+which covers Ctrl-C, `docker stop` and systemd. From your own code, call
+`zither.stop(io, &listener)`.
+
+Once stopped, `run` accepts nothing new. Requests already in a handler
+get `grace` (10 seconds by default) to finish, and their responses say
+`Connection: close`. After that, or as soon as no handler is running,
+the connections left are closed and `run` returns. A request that
+arrives on an idle connection right at that moment is cut off without an
+answer. Canceling `run` instead closes everything at once.
+
+`stopOnSignals` handles one listener and needs POSIX signals.
 
 ## License
 

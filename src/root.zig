@@ -5,6 +5,7 @@
 
 const app = @import("app.zig");
 const context = @import("context.zig");
+const stop_mod = @import("stop.zig");
 
 pub const App = app.App;
 pub const Route = app.Route;
@@ -15,6 +16,8 @@ pub const Params = context.Params;
 pub const QueryError = context.QueryError;
 pub const ReadJsonError = context.ReadJsonError;
 pub const Cookie = context.Cookie;
+pub const stop = stop_mod.stop;
+pub const stopOnSignals = stop_mod.stopOnSignals;
 
 test {
     _ = app;
@@ -22,4 +25,5 @@ test {
     _ = @import("router.zig");
     _ = @import("percent.zig");
     _ = @import("cookie.zig");
+    _ = stop_mod;
 }

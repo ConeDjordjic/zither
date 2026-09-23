@@ -23,8 +23,12 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("listening on :8080\n", .{});
 
+    // Ctrl-C lets requests in progress finish before it exits.
+    zither.stopOnSignals(&listener);
+
     var state: State = .{ .greeting = "hello" };
     try App.run(io, init.gpa, &listener, &state, .{});
+    std.debug.print("stopped\n", .{});
 }
 
 fn index(c: *Ctx) !void {

@@ -7,6 +7,7 @@ const Status = martensite.Status;
 const Response = martensite.Response;
 
 const router = @import("router.zig");
+const stop_mod = @import("stop.zig");
 const context = @import("context.zig");
 const Ctx = context.Ctx;
 
@@ -49,6 +50,8 @@ pub const Options = struct {
     /// Leaves `Secure` off every cookie, for local development over
     /// plain HTTP.
     insecure_cookies: bool = false,
+    /// How long `run` waits for requests in progress once it is stopped.
+    grace: Io.Clock.Duration = seconds(10),
 };
 
 fn plain(status: Status) Response {
@@ -73,34 +76,65 @@ fn statusFor(err: anyerror) Status {
     };
 }
 
+/// Shared by `run` and its connections while it stops.
+const Drain = struct {
+    draining: std.atomic.Value(bool) = .init(false),
+    /// Connections inside a handler.
+    busy: std.atomic.Value(usize) = .init(0),
+
+    /// Waits until no handler is running, or `grace` is up.
+    fn wait(drain: *Drain, io: Io, grace: Io.Clock.Duration) Io.Cancelable!void {
+        const until = (Io.Timeout{ .duration = grace }).toDeadline(io);
+        while (drain.busy.load(.seq_cst) != 0) {
+            if (until.toDurationFromNow(io).?.raw.nanoseconds <= 0) return;
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+    }
+};
+
 pub fn App(comptime State: type, comptime routes: []const Route(State)) type {
     const Table = router.Table(Handler(State), routes);
 
     return struct {
         pub const Context = Ctx(State);
 
-        /// Accepts connections until the listener is shut down, and
-        /// serves each one on its own task. `gpa` is used from all of
-        /// them at once, so it has to be thread-safe.
+        /// Accepts connections and serves each one on its own task.
+        /// `gpa` is used from all of them at once, so it has to be
+        /// thread-safe.
+        ///
+        /// `stop` or `stopOnSignals` make it stop accepting. Requests in
+        /// progress get `grace` to finish, and their responses say
+        /// `Connection: close`. Then every connection left is cut off,
+        /// and it returns. Canceling it cuts everything off right away.
         pub fn run(io: Io, gpa: std.mem.Allocator, listener: *net.Server, state: *State, options: Options) Io.Cancelable!void {
             var group: Io.Group = .init;
             defer group.cancel(io);
+            var drain: Drain = .{};
 
             while (true) {
                 const stream = listener.accept(io) catch |err| switch (err) {
                     error.Canceled => return error.Canceled,
-                    error.SocketNotListening => return,
+                    error.SocketNotListening => {
+                        drain.draining.store(true, .seq_cst);
+                        // The connections left are between requests. One
+                        // that sends a request right now gets cut off.
+                        return drain.wait(io, options.grace);
+                    },
                     else => {
                         log.warn("accept: {t}", .{err});
                         continue;
                     },
                 };
-                group.async(io, serveStream, .{ io, gpa, stream, state, options });
+                group.async(io, serveDraining, .{ io, gpa, stream, state, options, &drain });
             }
         }
 
         /// Serves one connection until it ends, and closes it.
         pub fn serveStream(io: Io, gpa: std.mem.Allocator, stream: net.Stream, state: *State, options: Options) Io.Cancelable!void {
+            return serveDraining(io, gpa, stream, state, options, null);
+        }
+
+        fn serveDraining(io: Io, gpa: std.mem.Allocator, stream: net.Stream, state: *State, options: Options, drain: ?*Drain) Io.Cancelable!void {
             defer stream.close(io);
 
             const bufs = gpa.alloc(u8, 3 * options.buffer) catch return;
@@ -121,7 +155,7 @@ pub fn App(comptime State: type, comptime routes: []const Route(State)) type {
                 .failure = reader.failureSource(),
             }) catch unreachable;
 
-            var dispatch: Dispatch = .{ .state = state, .io = io, .arena = &arena, .options = &options };
+            var dispatch: Dispatch = .{ .state = state, .io = io, .arena = &arena, .options = &options, .drain = drain };
             http.serve(&dispatch, .{
                 .deadline = reader.deadlines(),
                 .head = .{ .duration = options.head },
@@ -140,8 +174,23 @@ pub fn App(comptime State: type, comptime routes: []const Route(State)) type {
             io: Io,
             arena: *std.heap.ArenaAllocator,
             options: *const Options,
+            drain: ?*Drain = null,
 
             pub fn handle(d: *Dispatch, http: *Server, req: Server.Request) !void {
+                const drain = d.drain orelse return d.route(http, req);
+                _ = drain.busy.fetchAdd(1, .seq_cst);
+                defer _ = drain.busy.fetchSub(1, .seq_cst);
+                // Before, so the response says Connection: close. After,
+                // for a request that was already running when `run` was
+                // stopped.
+                if (drain.draining.load(.seq_cst)) http.keep_alive = false;
+                defer if (drain.draining.load(.seq_cst)) {
+                    http.keep_alive = false;
+                };
+                return d.route(http, req);
+            }
+
+            fn route(d: *Dispatch, http: *Server, req: Server.Request) !void {
                 _ = d.arena.reset(.{ .retain_with_limit = d.options.arena_keep });
                 const arena = d.arena.allocator();
 
@@ -172,6 +221,7 @@ pub fn App(comptime State: type, comptime routes: []const Route(State)) type {
                             .params = .{ .names = names, .values = values[0..names.len] },
                             .max_body = d.options.max_body,
                             .insecure_cookies = d.options.insecure_cookies,
+                            .draining = if (d.drain) |drain| &drain.draining else null,
                         };
                         return found.handler(&c);
                     },
@@ -476,6 +526,54 @@ test "a refusal drops the collected headers" {
     const got = exchange(&state, .{ .log_error = remember }, "POST /half HTTP/1.1\r\nHost: x\r\n\r\n", &out);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 "));
     try testing.expect(!has(got, "Set-Cookie"));
+}
+
+const SlowState = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+};
+
+fn slow(c: *Ctx(SlowState)) !void {
+    c.state.entered.store(true, .seq_cst);
+    try c.io.sleep(.fromMilliseconds(200), .awake);
+    try c.respond(.text(.ok, "done"));
+}
+
+test "stopping lets a request in progress finish and closes the idle ones" {
+    const io = testing.io;
+    const Slow = App(SlowState, &.{.get("/slow", slow)});
+
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var state: SlowState = .{};
+    var running = try io.concurrent(Slow.run, .{ io, testing.allocator, &listener, &state, .{} });
+
+    const busy = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer busy.close(io);
+    const idle = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer idle.close(io);
+
+    var wbuf: [64]u8 = undefined;
+    var w = busy.writer(io, &wbuf);
+    try w.interface.writeAll("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+    try w.interface.flush();
+    while (!state.entered.load(.seq_cst)) try io.sleep(.fromMilliseconds(1), .awake);
+
+    stop_mod.stop(io, &listener);
+    try running.await(io);
+
+    var rbuf: [512]u8 = undefined;
+    var r = busy.reader(io, &rbuf);
+    const got = try r.interface.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try testing.expect(has(got, "Connection: close\r\n"));
+    try testing.expect(std.mem.endsWith(u8, got, "done"));
+
+    var ir = idle.reader(io, &rbuf);
+    const rest = try ir.interface.allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(rest);
+    try testing.expectEqualStrings("", rest);
 }
 
 test "allow lists methods in a fixed order" {

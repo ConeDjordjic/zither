@@ -52,6 +52,8 @@ pub fn Ctx(comptime State: type) type {
         insecure_cookies: bool,
         /// What `header` and `setCookie` collected for the response.
         extra: std.ArrayList(Response.Header) = .empty,
+        /// Set while `run` is stopping.
+        draining: ?*const std.atomic.Value(bool) = null,
 
         const C = @This();
 
@@ -127,9 +129,13 @@ pub fn Ctx(comptime State: type) type {
         }
 
         /// Sends `r` with the headers from `header` and `setCookie`
-        /// after its own.
+        /// after its own. While `run` is stopping it also closes the
+        /// connection.
         pub fn respond(c: *C, r: Response) (Server.SendError || std.mem.Allocator.Error)!void {
             var out = r;
+            if (c.draining) |d| if (d.load(.seq_cst)) {
+                out.keep_alive = false;
+            };
             if (c.extra.items.len != 0) {
                 const all = try c.arena.alloc(Response.Header, r.headers.len + c.extra.items.len);
                 @memcpy(all[0..r.headers.len], r.headers);
