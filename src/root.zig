@@ -7,6 +7,10 @@ const app = @import("app.zig");
 const context = @import("context.zig");
 const stop_mod = @import("stop.zig");
 
+/// The martensite zither was built with. Use this one, so your types
+/// match the ones on `Ctx`.
+pub const martensite = @import("martensite");
+
 pub const App = app.App;
 pub const Route = app.Route;
 pub const Handler = app.Handler;
