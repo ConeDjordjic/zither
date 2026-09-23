@@ -1,0 +1,17 @@
+.{
+    .name = .zither,
+    .version = "0.0.1",
+    .fingerprint = 0x8b41b899cd937b1d,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .martensite = .{ .path = "../martensite" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "LICENSE",
+        "README.md",
+    },
+}
