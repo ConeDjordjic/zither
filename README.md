@@ -68,13 +68,70 @@ A handler gets a `*Ctx(State)` with:
 - `query(name)`, the first value for `name` in the query, decoded into
   the arena. A value with a bad `%` escape is `error.BadQuery`, which
   becomes a 400 if you let it go up.
+- `respond(r)`, which sends a martensite `Response` along with any
+  headers you added with `header` or `setCookie`. Calling
+  `c.http.respond` yourself sends the response without them.
+
+## JSON
+
+```zig
+fn login(c: *Ctx) !void {
+    const in = try c.readJson(struct { email: []const u8, password: []const u8 });
+    // ...
+    try c.json(.ok, .{ .id = id });
+}
+```
+
+`readJson(T)` reads the body and parses it into a `T` in the arena.
+Fields `T` doesn't have are skipped. Let its errors go up with `try` and
+zither answers them:
+
+- No body, bad JSON, or JSON that doesn't fit `T` is `error.BadJson`, a
+  400.
+- A Content-Type that isn't `application/json` is `error.NotJson`, a
+  415. That also keeps a plain HTML form on another site from posting to
+  a JSON route with your user's cookies, because a browser won't send
+  `application/json` across sites without asking your server first.
+- A body over `max_body` (1 MiB by default) is a 413. A chunked body
+  gets a buffer of `max_body`, because it doesn't say how long it is.
+
+Catch the error instead if one route wants its own answer.
+
+`json(status, value)` writes `value` as JSON into the arena and sends it.
+
+## Cookies
+
+`c.cookie(name)` is the value of the first cookie with that name, from
+any of the request's Cookie headers. Surrounding quotes are stripped and
+nothing is decoded.
+
+```zig
+try c.setCookie(.{ .name = "sid", .value = sid, .max_age = 30 * 24 * 3600 });
+try c.json(.ok, .{ .ok = true });
+```
+
+A cookie gets `Path=/`, `HttpOnly`, `Secure` and `SameSite=Lax` unless
+you turn them off on it. Set `insecure_cookies` in the options to leave
+`Secure` off everywhere while you develop over plain HTTP. Without
+`max_age` it lasts until the browser closes. `c.clearCookie(name)`
+deletes one that was set with the default path.
+
+A name that isn't a token, or a value with a space, `;`, `,`, `"` or `\`
+in it, is `error.InvalidCookie`. So is a path or domain with a `;`. A
+value like that would otherwise add attributes of its own.
+
+Cookies and headers are collected on the context and go out with the
+next `respond` or `json`. If the handler fails instead, the response
+zither sends for the error doesn't include them. So a login that set a
+session cookie and then failed doesn't leave the browser with a session.
 
 ## Errors
 
 zither answers some requests itself. That covers a 404, a 405, a 501, a
 request that couldn't be read, a param that doesn't decode and any error
-a handler returns before it responds. The status comes from martensite's
-`Status.forError`, so an error of your own is a 500.
+a handler returns before it responds. zither's own errors get the
+statuses above. Anything else gets martensite's `Status.forError`, so an
+error of your own is a 500.
 
 By default those responses are plain text. For something else, like
 JSON, pass `refuse` in the options. It gets the status and returns a

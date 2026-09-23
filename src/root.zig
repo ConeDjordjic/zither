@@ -13,10 +13,13 @@ pub const Options = app.Options;
 pub const Ctx = context.Ctx;
 pub const Params = context.Params;
 pub const QueryError = context.QueryError;
+pub const ReadJsonError = context.ReadJsonError;
+pub const Cookie = context.Cookie;
 
 test {
     _ = app;
     _ = context;
     _ = @import("router.zig");
     _ = @import("percent.zig");
+    _ = @import("cookie.zig");
 }

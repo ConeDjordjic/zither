@@ -11,6 +11,7 @@ const App = zither.App(State, &.{
     .get("/", index),
     .get("/hello/:name", hello),
     .get("/search", search),
+    .post("/name", setName),
 });
 
 pub fn main(init: std.process.Init) !void {
@@ -31,7 +32,8 @@ fn index(c: *Ctx) !void {
 }
 
 fn hello(c: *Ctx) !void {
-    const text = try std.fmt.allocPrint(c.arena, "{s} {s}\n", .{ c.state.greeting, c.param("name").? });
+    const seen = c.cookie("name") orelse "stranger";
+    const text = try std.fmt.allocPrint(c.arena, "{s} {s}, last time you were {s}\n", .{ c.state.greeting, c.param("name").?, seen });
     try c.respond(.text(.ok, text));
 }
 
@@ -39,4 +41,11 @@ fn search(c: *Ctx) !void {
     const q = try c.query("q") orelse return c.respond(.text(.bad_request, "no q\n"));
     const text = try std.fmt.allocPrint(c.arena, "you searched for {s}\n", .{q});
     try c.respond(.text(.ok, text));
+}
+
+fn setName(c: *Ctx) !void {
+    const in = try c.readJson(struct { name: []const u8 });
+    // Plain HTTP here, so no Secure.
+    try c.setCookie(.{ .name = "name", .value = in.name, .secure = false });
+    try c.json(.ok, .{ .remembered = in.name });
 }

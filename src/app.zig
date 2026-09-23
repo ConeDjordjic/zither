@@ -44,6 +44,11 @@ pub const Options = struct {
     max_drain: u64 = 64 * 1024,
     /// Arena memory a connection keeps between requests.
     arena_keep: usize = 64 * 1024,
+    /// The biggest body `readJson` accepts. A bigger one gets a 413.
+    max_body: u64 = 1024 * 1024,
+    /// Leaves `Secure` off every cookie, for local development over
+    /// plain HTTP.
+    insecure_cookies: bool = false,
 };
 
 fn plain(status: Status) Response {
@@ -62,7 +67,8 @@ fn seconds(n: i64) Io.Clock.Duration {
 /// zither gave it.
 fn statusFor(err: anyerror) Status {
     return switch (err) {
-        error.BadQuery => .bad_request,
+        error.BadQuery, error.BadJson => .bad_request,
+        error.NotJson => .unsupported_media_type,
         else => .forError(err),
     };
 }
@@ -164,6 +170,8 @@ pub fn App(comptime State: type, comptime routes: []const Route(State)) type {
                             .http = http,
                             .req = req,
                             .params = .{ .names = names, .values = values[0..names.len] },
+                            .max_body = d.options.max_body,
+                            .insecure_cookies = d.options.insecure_cookies,
                         };
                         return found.handler(&c);
                     },
@@ -218,7 +226,29 @@ const TestApp = App(TestState, &.{
     .get("/search", search),
     .post("/items", create),
     .get("/boom", boom),
+    .post("/login", login),
+    .get("/me", me),
+    .post("/half", half),
 });
+
+fn login(c: *TestCtx) !void {
+    const In = struct { name: []const u8 };
+    const in = try c.readJson(In);
+    try c.setCookie(.{ .name = "sid", .value = in.name, .max_age = 60 });
+    try c.json(.ok, .{ .hello = in.name });
+}
+
+fn me(c: *TestCtx) !void {
+    try c.clearCookie("old");
+    try c.header("X-Seen", "yes");
+    try c.respond(.text(.ok, c.cookie("sid") orelse "nobody"));
+}
+
+/// Sets a cookie and then fails, so the cookie must not go out.
+fn half(c: *TestCtx) !void {
+    try c.setCookie(.{ .name = "sid", .value = "leaked" });
+    return error.DatabaseDown;
+}
 
 fn hello(c: *TestCtx) !void {
     c.state.hits += 1;
@@ -363,6 +393,89 @@ test "a request that can't be read gets the refusal" {
     const got = exchange(&state, .{ .refuse = jsonRefusal }, "GET /hello/x HTTP/1.1\r\n\r\n", &out);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 "));
     try testing.expect(std.mem.endsWith(u8, got, "{\"error\":true}"));
+}
+
+test "readJson parses the body and setCookie goes out with json" {
+    var state: TestState = .{};
+    var out: [1024]u8 = undefined;
+    const body = "{\"name\":\"ana\",\"extra\":1}";
+    const got = exchange(&state, .{}, "POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json; charset=utf-8\r\n" ++
+        std.fmt.comptimePrint("Content-Length: {d}\r\n\r\n", .{body.len}) ++ body, &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try testing.expect(has(got, "Content-Type: application/json\r\n"));
+    try testing.expect(has(got, "Set-Cookie: sid=ana; Path=/; Max-Age=60; HttpOnly; Secure; SameSite=Lax\r\n"));
+    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n{\"hello\":\"ana\"}"));
+}
+
+test "insecure_cookies leaves out Secure" {
+    var state: TestState = .{};
+    var out: [1024]u8 = undefined;
+    const got = exchange(&state, .{ .insecure_cookies = true }, "POST /login HTTP/1.1\r\nHost: x\r\n" ++
+        "Content-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"name\":\"a\"}", &out);
+    try testing.expect(has(got, "Set-Cookie: sid=a; Path=/; Max-Age=60; HttpOnly; SameSite=Lax\r\n"));
+}
+
+test "a chunked JSON body" {
+    var state: TestState = .{};
+    var out: [1024]u8 = undefined;
+    const got = exchange(&state, .{}, "POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n6\r\n{\"name\r\n6\r\n\":\"b\"}\r\n0\r\n\r\n", &out);
+    try testing.expect(std.mem.endsWith(u8, got, "{\"hello\":\"b\"}"));
+}
+
+test "bad JSON is a 400 and the connection stays" {
+    var state: TestState = .{};
+    var out: [1024]u8 = undefined;
+    const got = exchange(&state, .{}, "POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" ++
+        "Content-Length: 3\r\n\r\n{no" ++ "GET /me HTTP/1.1\r\nHost: x\r\n\r\n", &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 "));
+    try testing.expect(std.mem.endsWith(u8, got, "nobody"));
+}
+
+test "JSON of the wrong shape and no body are both a 400" {
+    var state: TestState = .{};
+    var out: [1024]u8 = undefined;
+    var got = exchange(&state, .{}, "POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" ++
+        "Content-Length: 10\r\n\r\n{\"name\":1}", &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 "));
+    got = exchange(&state, .{}, "POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\r\n", &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 "));
+}
+
+test "a body that isn't application/json is a 415" {
+    var state: TestState = .{};
+    var out: [1024]u8 = undefined;
+    for ([_][]const u8{ "Content-Type: text/plain\r\n", "" }) |ct| {
+        var input: [256]u8 = undefined;
+        const req = try std.fmt.bufPrint(&input, "POST /login HTTP/1.1\r\nHost: x\r\n{s}Content-Length: 12\r\n\r\n{{\"name\":\"a\"}}", .{ct});
+        const got = exchange(&state, .{}, req, &out);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 415 "));
+    }
+}
+
+test "a body over max_body is a 413" {
+    var state: TestState = .{};
+    var out: [1024]u8 = undefined;
+    const got = exchange(&state, .{ .max_body = 4 }, "POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" ++
+        "Content-Length: 12\r\n\r\n{\"name\":\"a\"}", &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 "));
+}
+
+test "cookies are read across Cookie headers, and headers are collected" {
+    var state: TestState = .{};
+    var out: [1024]u8 = undefined;
+    const got = exchange(&state, .{}, "GET /me HTTP/1.1\r\nHost: x\r\nCookie: a=1\r\nCookie: sid=\"ana\"\r\n\r\n", &out);
+    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nana"));
+    try testing.expect(has(got, "Set-Cookie: old=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax\r\n"));
+    try testing.expect(has(got, "X-Seen: yes\r\n"));
+}
+
+test "a refusal drops the collected headers" {
+    var state: TestState = .{};
+    var out: [1024]u8 = undefined;
+    const got = exchange(&state, .{ .log_error = remember }, "POST /half HTTP/1.1\r\nHost: x\r\n\r\n", &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 "));
+    try testing.expect(!has(got, "Set-Cookie"));
 }
 
 test "allow lists methods in a fixed order" {
